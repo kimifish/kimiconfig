@@ -149,6 +149,14 @@ print(cfg.debug) # Output: False
 print(cfg.database.file) # Output: prod.db
 ```
 
+Or in some cases it is better to split initiation and loads:
+
+```python
+cfg = Config()
+cfg.load_files(['base.yaml', 'override.yaml'])
+cfg.load_args(sys.argv[1:])
+```
+
 ### File Change Monitoring
 
 Enable `watch_mtime=True` to automatically reload the configuration if any of the source files are modified.
