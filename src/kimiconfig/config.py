@@ -31,7 +31,7 @@ Example:
 
 import os
 import time
-from typing import Dict, Any, Union, List
+from typing import Dict, Any, Union, List, Callable
 import yaml
 from dataclasses import make_dataclass, is_dataclass, asdict
 import logging
@@ -136,7 +136,7 @@ class Config(metaclass=Singleton):
         shutdown_flag (bool): Flag to stop the polling thread
                               Can be used as shutdown flag for other threads
     Args:
-        file (Union[str, List[str]]): Path(s) to YAML configuration file(s). Later files override earlier ones.
+        file (Union[str, List[str]]): Path(s) to YAML or JSON configuration file(s). Later files override earlier ones.
         args (List[str], optional): Command line arguments to parse and apply.
         use_dataclasses (bool): Convert nested dictionaries to dataclasses for better type hints.
         watch_mtime (bool): Enable automatic config reload when files change.
@@ -170,19 +170,25 @@ class Config(metaclass=Singleton):
     """
 
     def __init__(self, file: Union[str, List[str]] = '', 
-                 args: List[str] = None, 
-                 use_dataclasses: bool = False,
+                 args: List[str]|None = None, 
+                 use_dataclasses: bool = True,
                  env_prefix: str = 'DEFAULT_APP_',
                  watch_mtime: bool = False, 
                  watch_interval: int = 15):
         self._use_dataclasses = use_dataclasses
         self.data = {}
+        # Inside data is stored by source and merges (from top to bottom) to 'self.data' after any change:
         self._file_data = {}
-        self._args_data = {}
         self._env_data = {}
+        self._args_data = {}
         self._runtime_update_data = {}
+
+        # For runtime variables sometimes it's useful placing them in one branch.
+        self.runtime: dict
+
         self._args = {}
         self.shutdown_flag = False
+        self._update_callbacks: List[Callable[[], None]] = []
         self._init_default_logging()
         
         # Convert file to list
@@ -330,12 +336,47 @@ class Config(metaclass=Singleton):
         # Create and return an instance with our values
         return dynamic_class(**values)
 
+    def _validate_attribute_override(self, data_to_check: Dict[str, Any]):
+        """
+        Checks if any top-level keys in data_to_check would override
+        existing methods or "protected" attributes of the Config instance.
+        """
+        conflicting_keys = []
+        # Consider attributes of the class itself (methods, class variables)
+        # and also instance-specific attributes that might be critical (e.g., _file_data)
+        # dir(self) gives all attributes, including methods and inherited ones.
+        # We are primarily interested in preventing override of methods and core attributes.
+        instance_attrs = dir(self)
+
+        for key in data_to_check.keys():
+            if key in instance_attrs:
+                # Check if it's a method or a "protected" variable (by convention, starts with '_')
+                # We allow overriding normal data attributes that might have been set by previous configs.
+                attr = getattr(self, key)
+                if callable(attr):
+                    conflicting_keys.append(key)
+                # Example of protecting specific non-method attributes if needed:
+                # elif key in ['data', '_file_data', '_env_data', '_args_data', '_runtime_update_data', 'shutdown_flag']:
+                #     conflicting_keys.append(key)
+
+        if conflicting_keys:
+            conflicting_keys.sort()
+            raise ValueError(
+                f"Configuration keys conflict with existing class attributes/methods: {', '.join(conflicting_keys)}. "
+                f"Please rename these keys in your configuration."
+            )
+
     def _update_data_from_all_x_data(self):
-        """Updates configuration data"""
-        self._deep_update(self.data, self._file_data)  # Order is important as data can be overwritten
+        """Updates configuration data and validates before applying attributes"""
+        # Clear and rebuild self.data from all sources
+        self.data.clear()
+        self._deep_update(self.data, self._file_data)
         self._deep_update(self.data, self._env_data)
         self._deep_update(self.data, self._args_data)
         self._deep_update(self.data, self._runtime_update_data)
+        
+        # Validate before attempting to set attributes
+        self._validate_attribute_override(self.data)
         return self
 
     def _update_attributes_from_data(self):
@@ -343,7 +384,6 @@ class Config(metaclass=Singleton):
         if self._use_dataclasses:
             for k, v in self.data.items():
                 if isinstance(v, dict):
-                    # Create a dataclass directly, without additional calls
                     setattr(self, k, self._dict_to_dataclass(v, f"Config_{k}"))
                 else:
                     setattr(self, k, v)
@@ -383,10 +423,15 @@ class Config(metaclass=Singleton):
             
             if reload_needed:
                 self._file_data.clear()  # Clear old data
-                self._load_from_yaml()  # Reload all files
+                self._load_from_files()  # Reload all files
                 self._update_data_from_all_x_data()._update_attributes_from_data()
+                for callback in self._update_callbacks:
+                    try:
+                        callback()
+                    except Exception as e:
+                        log.error(f"Error executing update callback {getattr(callback, '__name__', 'unknown')}: {e}")
 
-    def load_files(self, files: List[str]):
+    def load_files(self, files: list[str]):
         """Loads configuration from files"""
         if isinstance(files, str):
             files = [files]
@@ -394,11 +439,95 @@ class Config(metaclass=Singleton):
         self._load_from_files()
         self._update_data_from_all_x_data()._update_attributes_from_data()
     
-    def load_args(self, args=List[str]):
+    def load_args(self, args: list[str]):
         if isinstance(args, str):
             args = [args,]
         self._load_from_args(_parse_args(args))
         self._update_data_from_all_x_data()._update_attributes_from_data()
+
+    def register_update_callback(self, callback: Callable[[], None]) -> None:
+        """
+        Registers a callback function to be executed after configuration is updated.
+
+        Args:
+            callback: A function to be called when the configuration changes.
+                      The callback should not take any arguments.
+        """
+        if callable(callback):
+            self._update_callbacks.append(callback)
+        else:
+            log.warning(f"Attempted to register a non-callable object as a callback: {callback}")
+
+    def validate_config(self, keys_to_validate: List[str]) -> None:
+        """
+        Validates that a list of specified keys (potentially with wildcards)
+        exist in the configuration.
+
+        Args:
+            keys_to_validate: A list of strings, where each string is a dot-separated
+                              key. The '%' character can be used as a wildcard to match
+                              any key at that specific level. For example, "mqtt.servers.%.address"
+                              checks that all children of "mqtt.servers" have an "address" key.
+                              If "mqtt.servers" has no children, it's not an error.
+
+        Raises:
+            ValueError: If any of the specified keys are not found, containing a list
+                        of all missing keys.
+        """
+        missing_keys = []
+        for key_str in keys_to_validate:
+            if not self._is_key_present_recursive(self.data, key_str.split('.')):
+                missing_keys.append(key_str)
+        
+        if missing_keys:
+            # Sort for consistent error messages, helpful for tests
+            missing_keys.sort()
+            raise ValueError(f"Missing configuration keys: {', '.join(missing_keys)}")
+
+    def _is_key_present_recursive(self, current_data: Any, path_parts: List[str]) -> bool:
+        """
+        Internal recursive helper to check for key presence with wildcard support.
+        """
+        if not path_parts:
+            # All parts of the key path have been successfully traversed.
+            return True
+
+        part = path_parts[0]
+        remaining_parts = path_parts[1:]
+
+        if part == '%':
+            if not isinstance(current_data, dict):
+                # Expected a dictionary to expand wildcard '%', but found something else
+                # or current_data is None (e.g. parent key did not exist).
+                return False
+
+            if not current_data:
+                # Current level is an empty dictionary.
+                return True
+
+            if not remaining_parts:
+                # Key is like "a.b.%". This means "a.b" must be a dictionary.
+                # If we are here, current_data is a dictionary (possibly empty), which is valid.
+                return True
+
+            # Wildcard '%' followed by more path parts (e.g., "%.address").
+            # All children must satisfy the remaining_parts.
+            all_children_valid = True
+            # If current_data is an empty dict, the loop won't run, all_children_valid remains True.
+            for child_node in current_data.values():
+                if not self._is_key_present_recursive(child_node, remaining_parts):
+                    all_children_valid = False
+                    break  # If one child fails, the whole wildcard pattern fails for this level.
+            
+            return all_children_valid
+        
+        else: # Regular key part
+            if not isinstance(current_data, dict) or part not in current_data:
+                # Key part not found, or current_data is not a dictionary to look into.
+                return False
+            
+            # Move to the next level of nesting.
+            return self._is_key_present_recursive(current_data[part], remaining_parts)
 
     def shutdown(self):
         """Stops the polling"""
@@ -538,18 +667,3 @@ if __name__ == '__main__':
             cfg.shutdown()
             sys.exit(0)
 
-#           YAML example
-# webapi_options:
-#   host: "192.168.196.100"
-#   port: 5003
-#   log_level: "info"
-#   use_ssl: False
-# tts_options:
-#   put_accent: True
-#   put_yo: True
-#   sample_rate: 24000
-#   speaker: 'xenia'
-#   speaker_by_assname:
-#     "николай": 'aidar'
-#   threads: 1
-#   v: "2.0"

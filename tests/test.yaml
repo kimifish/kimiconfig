@@ -1,0 +1,91 @@
+openhab_server:
+  host: http://kimihome.lan:8080
+  username: .env
+  password: .env
+
+# Filter OpenHAB items before passing to MCP Client
+items_filter:
+  # Note: Black and white lists are NOT exclusive and can work together. 
+  #       But server is barely usable if both enabled.
+  #
+  # Black list. Filters out items with tags below, or with names endings.
+  black:
+    enabled: True
+    tags:
+      - NoAI
+    endings:
+      - _Machinery
+
+  # White list.
+  white:
+    enabled: False
+    tags:
+      - AI
+    endings: []
+
+# Every 1st level key below creates two tools - "list_x" and "get_x_items(some_x_child)" for every "x" key.
+#
+#  list_x - is static, requests data from OH only on start, 
+#           thus consider to populate it with rarely changed fields only.
+#           Maybe I'll replace it with MCP source later. Or just add it side-by-side.
+#
+#  get_x_items - is dynamic, fetches data from OH server, items states and so on.
+#
+# Values for fields - are from OpenHAB REST API: name, state, type, label, 
+# category, tags, link, groupNames, members, metadata, stateDescription.
+semantic_groups:
+  rooms: 
+    tags:  # All group items with given tags will be added to list, all their childs recursively - to items list.
+      - Rooms
+    list_tool:
+      desc: "Fetches list of all rooms."
+      fields_returned: [name, label]
+    items_tool:
+      desc: "Fetches all items for given room."
+      fields_returned: [name, label, type, state]
+
+  terminals:
+    tags:
+      - Smartphone
+      - NetworkAppliance
+      - Receiver
+    list_tool:
+      desc: "Fetches list of all PCs, smartphones, etc."
+      fields_returned: [name, label]
+    items_tool:
+      desc: "Fetches all parameters and managing items for given terminal."
+      fields_returned: [name, label, type, state]
+
+
+# OpenHAB items of specific type, defined by user. 
+# Usually it is a String item with specific logic, not implemented in vanilla OH.
+# e.g. Switch with additional "AUTO" value.
+# Every 1st level key below creates instruction to LLM (and validation rule) to send 
+# values listed to items with tag or name ending.
+special_items:
+  lbm_switch:
+    type: str
+    # Below is default description, that is generated from specified data when no description found.
+    # description: "For items with tags: ['LBM_Switch'] or item names ending with '_LBM'). One of [ON, OFF, AUTO]."
+    description: "For switches with auto mode (item has tag 'LBM_Switch' of it's name ends with '_LBM'). One of [ON, OFF, AUTO]."
+    tags:
+      - LBM_Switch
+    endings:
+      - "_LBM"
+    possible_values:
+      - ON
+      - OFF
+      - AUTO
+
+
+logging:
+  # level: "INFO"
+  level: "DEBUG"
+  filename: "oh-mcp.log"
+  loggers:
+    suppress:
+      - "httpx"
+      - "httpcore"
+      - "urllib3.connectionpool"
+    suppress_level: "WARNING"
+
