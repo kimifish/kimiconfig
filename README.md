@@ -31,13 +31,15 @@ A flexible configuration management system for Python applications.
 You can install `kimiconfig` using pip:
 
 ```bash
-pip install kimiconfig
+git clone https://github.com/kimifish/kimiconfig
+cd kimiconfig
+pip install .
 ```
 
 To include optional Rich support for formatted output:
 
 ```bash
-pip install kimiconfig[full]
+pip install ".[full]"
 ```
 
 ## Usage
